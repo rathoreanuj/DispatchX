@@ -1,0 +1,150 @@
+services:
+  # Infrastructure: Prometheus Metrics Server
+  prom-server:
+    image: prom/prometheus
+    container_name: notification_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+
+  # Infrastructure: Grafana Visualization Dashboard (User has existing 'grafana' container on port 3000)
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: notification_grafana
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_USER=admin
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #   depends_on:
+  #     - prom-server
+  #   restart: always
+    
+  # Infrastructure: Redis Cache & Rate Limiter
+  redis:
+    image: redis:7-alpine
+    container_name: notification_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Infrastructure: RabbitMQ Message Broker & DLQ
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: notification_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Microservice 1: Auth Service
+  auth-service:
+    build:
+      context: ./Auth-Service
+      dockerfile: Dockerfile
+    container_name: notification_auth_service
+    ports:
+      - "5001:5001"
+    environment:
+      - PORT=5001
+      - MONGODB=${MONGODB}
+      - JWT_SECRET=${JWT_SECRET}
+      - REFRESH_TOKEN_SECRET=${REFRESH_TOKEN_SECRET}
+      - LOKI_HOST=${LOKI_HOST:-http://loki:3100}
+    restart: always
+
+  # Microservice 2: Notification Service (Transactional Outbox Publisher)
+  notification-service:
+    build:
+      context: ./Notification-Service
+      dockerfile: Dockerfile
+    container_name: notification_service
+    ports:
+      - "5002:5002"
+    environment:
+      - PORT=5002
+      - MONGODB=${MONGODB}
+      - RABBITMQ_URL=amqp://rabbitmq:5672
+      - EMAIL_FROM=${EMAIL_FROM:-onboarding@resend.dev}
+      - LOKI_HOST=${LOKI_HOST:-http://loki:3100}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: always
+
+  # Microservice 3: Worker Service (Consumer, Idempotency & Nodemailer SMTP)
+  worker-service:
+    build:
+      context: ./Worker-Service
+      dockerfile: Dockerfile
+    container_name: notification_worker_service
+    ports:
+      - "5003:5003"
+    environment:
+      - PORT=5003
+      - MONGODB=${MONGODB}
+      - RABBITMQ_URL=amqp://rabbitmq:5672
+      - REDIS_URL=redis://redis:6379
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - EMAIL_FROM=${EMAIL_FROM:-onboarding@resend.dev}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - WORKER_PREFETCH=10
+      - RATE_LIMIT_MAX_MSGS=30
+      - RATE_LIMIT_WINDOW_SEC=10
+      - LOKI_HOST=${LOKI_HOST:-http://loki:3100}
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: always
+
+  # Microservice 4: API Gateway (Sliding Window Rate Limiter & Reverse Proxy)
+  api-gateway:
+    build:
+      context: ./Api-Gateway
+      dockerfile: Dockerfile
+    container_name: notification_api_gateway
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - REDIS_URL=redis://redis:6379
+      - AUTH_SERVICE_URL=http://auth-service:5001
+      - NOTIFICATION_SERVICE_URL=http://notification-service:5002
+      - WORKER_SERVICE_URL=http://worker-service:5003
+      - JWT_SECRET=${JWT_SECRET}
+      - LOKI_HOST=${LOKI_HOST:-http://loki:3100}
+    depends_on:
+      - auth-service
+      - notification-service
+      - worker-service
+      - redis
+    restart: always
+
+  # Frontend Web Client (Nginx Static Asset Server)
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    container_name: notification_frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - api-gateway
+    restart: always
